@@ -19,7 +19,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 18px;
+    gap: 16px;
     font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     background: linear-gradient(135deg, var(--bg1), var(--bg2));
     color: #f3f4f6;
@@ -51,7 +51,7 @@
   }
   .dot.black { background: radial-gradient(circle at 35% 30%, #666, #000); }
   .dot.white { background: radial-gradient(circle at 35% 30%, #fff, #bbb); }
-  button, select {
+  button, select, input {
     font-family: inherit;
     font-size: 14px;
     padding: 8px 14px;
@@ -64,10 +64,19 @@
   }
   button:hover { background: #2563eb; }
   button:active { transform: scale(.96); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
   button.ghost { background: rgba(255,255,255,.12); }
   button.ghost:hover { background: rgba(255,255,255,.22); }
   select { background: rgba(255,255,255,.12); }
   select option { color: #000; }
+  input {
+    background: rgba(255,255,255,.15);
+    cursor: text;
+    width: 130px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  input::placeholder { color: rgba(255,255,255,.5); letter-spacing: 0; text-transform: none; }
   #boardWrap {
     position: relative;
     background: var(--board);
@@ -77,7 +86,38 @@
     touch-action: none;
   }
   canvas { display: block; cursor: pointer; border-radius: 4px; }
-  .hint { font-size: 12px; opacity: .6; }
+  .hint { font-size: 12px; opacity: .6; max-width: 520px; text-align: center; line-height: 1.6; }
+  /* 联机面板 */
+  #onlinePanel {
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    align-items: center;
+    background: rgba(255,255,255,.06);
+    padding: 14px 18px;
+    border-radius: 12px;
+    max-width: 520px;
+  }
+  #onlinePanel.show { display: flex; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .roomcode {
+    font-size: 22px;
+    font-weight: bold;
+    letter-spacing: 4px;
+    color: #fbbf24;
+    background: rgba(0,0,0,.3);
+    padding: 4px 14px;
+    border-radius: 8px;
+    user-select: all;
+  }
+  .net-msg { font-size: 13px; opacity: .85; min-height: 18px; text-align: center; }
+  .role-tag {
+    font-size: 13px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: rgba(34,197,94,.25);
+    color: #86efac;
+  }
 </style>
 </head>
 <body>
@@ -86,7 +126,8 @@
     <select id="mode">
       <option value="pve-easy">人机对战 · 简单</option>
       <option value="pve-hard" selected>人机对战 · 困难</option>
-      <option value="pvp">双人对战</option>
+      <option value="pvp">双人对战（同设备）</option>
+      <option value="online">联机对战（和朋友）</option>
     </select>
     <select id="firstMove">
       <option value="human">我执黑先手</option>
@@ -95,17 +136,36 @@
     <button id="restart">重新开始</button>
     <button id="undo" class="ghost">悔棋</button>
   </div>
+
+  <!-- 联机面板 -->
+  <div id="onlinePanel">
+    <div class="row" id="netSetup">
+      <button id="createRoom">创建房间</button>
+      <span style="opacity:.5">或</span>
+      <input id="joinInput" placeholder="输入房间号" maxlength="6" autocomplete="off">
+      <button id="joinRoom">加入房间</button>
+    </div>
+    <div class="row" id="netRoomInfo" style="display:none">
+      <span>房间号：</span><span class="roomcode" id="roomCode">----</span>
+      <button id="copyCode" class="ghost">复制</button>
+      <span class="role-tag" id="roleTag"></span>
+      <button id="leaveRoom" class="ghost">退出房间</button>
+    </div>
+    <div class="net-msg" id="netMsg">把房间号发给朋友，对方输入后即可开始对战</div>
+  </div>
+
   <div class="status" id="status"><span class="dot black"></span>黑棋落子</div>
   <div id="boardWrap">
     <canvas id="board"></canvas>
   </div>
-  <div class="hint">15×15 棋盘，先连成五子者获胜</div>
+  <div class="hint" id="hint">15×15 棋盘，先连成五子者获胜</div>
 
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 (() => {
-  const N = 15;                 // 棋盘格数
-  const CELL = 38;              // 每格像素
-  const PAD = 20;               // 边距
+  const N = 15;
+  const CELL = 38;
+  const PAD = 20;
   const SIZE = PAD * 2 + CELL * (N - 1);
   const EMPTY = 0, BLACK = 1, WHITE = 2;
 
@@ -114,8 +174,9 @@
   const statusEl = document.getElementById('status');
   const modeEl = document.getElementById('mode');
   const firstEl = document.getElementById('firstMove');
+  const undoBtn = document.getElementById('undo');
+  const hintEl = document.getElementById('hint');
 
-  // 适配高分屏
   const DPR = window.devicePixelRatio || 1;
   canvas.width = SIZE * DPR;
   canvas.height = SIZE * DPR;
@@ -125,35 +186,44 @@
 
   let board, current, history, gameOver, aiColor, lastMove;
 
-  function reset() {
+  // 联机状态
+  const net = {
+    peer: null,
+    conn: null,
+    isHost: false,
+    myColor: 0,      // 我方颜色（联机时）
+    connected: false,
+  };
+  function isOnline() { return modeEl.value === 'online'; }
+
+  function reset(broadcast = true) {
     board = Array.from({ length: N }, () => new Array(N).fill(EMPTY));
     current = BLACK;
     history = [];
     gameOver = false;
     lastMove = null;
     const mode = modeEl.value;
-    if (mode === 'pvp') {
+    if (mode === 'pvp' || mode === 'online') {
       aiColor = 0;
     } else {
       aiColor = firstEl.value === 'ai' ? BLACK : WHITE;
     }
     draw();
     updateStatus();
-    if (current === aiColor) setTimeout(aiMove, 250);
+    if (isOnline() && net.connected && broadcast) send({ type: 'restart' });
+    if (!isOnline() && current === aiColor) setTimeout(aiMove, 250);
   }
 
   // ---------- 绘制 ----------
   function draw() {
     ctx.clearRect(0, 0, SIZE, SIZE);
-    // 网格线
-    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--line') || '#5a3d1a';
+    ctx.strokeStyle = '#5a3d1a';
     ctx.lineWidth = 1;
     for (let i = 0; i < N; i++) {
       const p = PAD + i * CELL;
       ctx.beginPath(); ctx.moveTo(PAD, p); ctx.lineTo(SIZE - PAD, p); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(p, PAD); ctx.lineTo(p, SIZE - PAD); ctx.stroke();
     }
-    // 星位
     const stars = [3, 7, 11];
     ctx.fillStyle = '#5a3d1a';
     for (const r of stars) for (const c of stars) {
@@ -161,11 +231,9 @@
       ctx.arc(PAD + c * CELL, PAD + r * CELL, 3.5, 0, Math.PI * 2);
       ctx.fill();
     }
-    // 棋子
     for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
       if (board[r][c] !== EMPTY) drawStone(r, c, board[r][c]);
     }
-    // 最后一手标记
     if (lastMove) {
       const [r, c] = lastMove;
       ctx.strokeStyle = '#e11d48';
@@ -191,29 +259,37 @@
     if (text) { statusEl.innerHTML = text; return; }
     const cls = current === BLACK ? 'black' : 'white';
     const name = current === BLACK ? '黑棋' : '白棋';
-    const who = (aiColor && current === aiColor) ? '（电脑思考中…）' : '落子';
+    let who = '落子';
+    if (aiColor && current === aiColor) who = '（电脑思考中…）';
+    if (isOnline() && net.connected) {
+      who = (current === net.myColor) ? '（轮到你了）' : '（等待对方…）';
+    }
     statusEl.innerHTML = `<span class="dot ${cls}"></span>${name}${who}`;
   }
 
-  // ---------- 交互 ----------
-  function placeAt(r, c) {
+  // ---------- 落子 ----------
+  // fromNet=true 表示来自网络，不再广播
+  function placeAt(r, c, fromNet = false) {
     if (gameOver || board[r][c] !== EMPTY) return false;
-    board[r][c] = current;
-    history.push([r, c, current]);
+    const color = current;
+    board[r][c] = color;
+    history.push([r, c, color]);
     lastMove = [r, c];
-    if (checkWin(r, c, current)) {
+
+    if (isOnline() && net.connected && !fromNet) send({ type: 'move', r, c });
+
+    if (checkWin(r, c, color)) {
       gameOver = true;
       draw();
-      const name = current === BLACK ? '黑棋' : '白棋';
-      const cls = current === BLACK ? 'black' : 'white';
-      updateStatus(`<span class="dot ${cls}"></span>${name}获胜！🎉`);
+      const name = color === BLACK ? '黑棋' : '白棋';
+      const cls = color === BLACK ? 'black' : 'white';
+      let extra = '获胜！🎉';
+      if (isOnline() && net.connected) extra = (color === net.myColor) ? '你赢了！🎉' : '你输了…';
+      updateStatus(`<span class="dot ${cls}"></span>${name}${extra}`);
       return true;
     }
     if (isFull()) {
-      gameOver = true;
-      draw();
-      updateStatus('平局！');
-      return true;
+      gameOver = true; draw(); updateStatus('平局！'); return true;
     }
     current = current === BLACK ? WHITE : BLACK;
     draw();
@@ -223,18 +299,22 @@
 
   canvas.addEventListener('click', (e) => {
     if (gameOver) return;
-    if (aiColor && current === aiColor) return; // 电脑回合不接受点击
+    if (!isOnline() && aiColor && current === aiColor) return;
+    if (isOnline()) {
+      if (!net.connected) { setNetMsg('请先创建或加入房间'); return; }
+      if (current !== net.myColor) return; // 不是我的回合
+    }
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
     const c = Math.round((x - PAD) / CELL);
     const r = Math.round((y - PAD) / CELL);
     if (r < 0 || r >= N || c < 0 || c >= N) return;
     if (placeAt(r, c)) {
-      if (!gameOver && aiColor && current === aiColor) setTimeout(aiMove, 200);
+      if (!gameOver && !isOnline() && aiColor && current === aiColor) setTimeout(aiMove, 200);
     }
   });
 
-  // ---------- 胜负判断 ----------
+  // ---------- 胜负 ----------
   const DIRS = [[0,1],[1,0],[1,1],[1,-1]];
   function checkWin(r, c, color) {
     for (const [dr, dc] of DIRS) {
@@ -251,15 +331,13 @@
   // ---------- AI ----------
   function aiMove() {
     if (gameOver) return;
-    const depth = modeEl.value === 'pve-hard' ? 2 : 0; // 困难用浅层搜索
+    const depth = modeEl.value === 'pve-hard' ? 2 : 0;
     const move = bestMove(aiColor, depth);
     if (move) {
       placeAt(move[0], move[1]);
       if (!gameOver && aiColor && current === aiColor) setTimeout(aiMove, 200);
     }
   }
-
-  // 棋型评分表
   function scoreLine(count, openEnds) {
     if (count >= 5) return 1000000;
     if (count === 4) return openEnds === 2 ? 100000 : (openEnds === 1 ? 10000 : 0);
@@ -268,12 +346,10 @@
     if (count === 1) return openEnds === 2 ? 10 : (openEnds === 1 ? 3 : 0);
     return 0;
   }
-
   function evalPoint(r, c, color) {
     let total = 0;
     for (const [dr, dc] of DIRS) {
-      let count = 1, open = 0;
-      let s = 1;
+      let count = 1, open = 0, s = 1;
       while (s < 5) { const nr=r+dr*s, nc=c+dc*s; if (inB(nr,nc)&&board[nr][nc]===color){count++;s++;} else { if(inB(nr,nc)&&board[nr][nc]===EMPTY) open++; break; } }
       s = 1;
       while (s < 5) { const nr=r-dr*s, nc=c-dc*s; if (inB(nr,nc)&&board[nr][nc]===color){count++;s++;} else { if(inB(nr,nc)&&board[nr][nc]===EMPTY) open++; break; } }
@@ -281,8 +357,6 @@
     }
     return total;
   }
-
-  // 候选点：仅考虑已有棋子附近，提速
   function candidates() {
     const set = new Set();
     const out = [];
@@ -302,19 +376,15 @@
     if (!any) return [[7,7]];
     return out;
   }
-
   function bestMove(color, depth) {
     const opp = color === BLACK ? WHITE : BLACK;
     const cands = candidates();
     let best = null, bestScore = -Infinity;
     for (const [r, c] of cands) {
-      // 自己进攻分 + 防守对手分
       const atk = evalPoint(r, c, color);
       const def = evalPoint(r, c, opp) * 0.9;
       let score = atk + def;
-
       if (depth > 0) {
-        // 一层对手最优反击模拟
         board[r][c] = color;
         if (checkWin(r, c, color)) { board[r][c] = EMPTY; return [r, c]; }
         let worst = -Infinity;
@@ -326,25 +396,164 @@
         board[r][c] = EMPTY;
         score = atk - worst * 1.1;
       }
-      // 轻微偏好靠中心
       score += -(Math.abs(r - 7) + Math.abs(c - 7)) * 0.5;
-
       if (score > bestScore) { bestScore = score; best = [r, c]; }
     }
     return best;
   }
 
-  // ---------- 按钮 ----------
-  document.getElementById('restart').addEventListener('click', reset);
-  modeEl.addEventListener('change', () => {
-    firstEl.disabled = modeEl.value === 'pvp';
-    reset();
+  // ====================== 联机 (WebRTC / PeerJS) ======================
+  const onlinePanel = document.getElementById('onlinePanel');
+  const netSetup = document.getElementById('netSetup');
+  const netRoomInfo = document.getElementById('netRoomInfo');
+  const netMsgEl = document.getElementById('netMsg');
+  const roomCodeEl = document.getElementById('roomCode');
+  const roleTag = document.getElementById('roleTag');
+  const joinInput = document.getElementById('joinInput');
+
+  const PREFIX = 'wuziqi-room-'; // PeerJS 公共服务器上的房间ID前缀
+  function setNetMsg(t) { netMsgEl.textContent = t; }
+  function randCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let s = '';
+    for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    return s;
+  }
+
+  function send(obj) {
+    if (net.conn && net.conn.open) {
+      try { net.conn.send(obj); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function onData(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'move') {
+      // 对方落子
+      if (current !== net.myColor) placeAt(data.r, data.c, true);
+    } else if (data.type === 'restart') {
+      reset(false);
+      setNetMsg('对方发起了新对局');
+    } else if (data.type === 'hello') {
+      setNetMsg('对方已加入，开始对战！');
+    }
+  }
+
+  function wireConn(conn) {
+    net.conn = conn;
+    conn.on('open', () => {
+      net.connected = true;
+      netSetup.style.display = 'none';
+      netRoomInfo.style.display = 'flex';
+      roleTag.textContent = net.isHost ? '你执黑 ●（先手）' : '你执白 ○（后手）';
+      setNetMsg(net.isHost ? '对方已加入，你先落子！' : '已连接，等待对方落子');
+      send({ type: 'hello' });
+      reset(false);
+    });
+    conn.on('data', onData);
+    conn.on('close', () => {
+      net.connected = false;
+      setNetMsg('对方已断开连接');
+      updateStatus('对方已离线');
+    });
+    conn.on('error', () => setNetMsg('连接出错，请重试'));
+  }
+
+  function createRoom() {
+    cleanupPeer();
+    const code = randCode();
+    net.isHost = true;
+    net.myColor = BLACK; // 房主执黑先手
+    setNetMsg('正在创建房间…');
+    net.peer = new Peer(PREFIX + code);
+    net.peer.on('open', () => {
+      roomCodeEl.textContent = code;
+      netSetup.style.display = 'none';
+      netRoomInfo.style.display = 'flex';
+      roleTag.textContent = '你执黑 ●（先手）';
+      setNetMsg('房间已创建！把房间号发给朋友，等待加入…');
+      reset(false);
+    });
+    net.peer.on('connection', (conn) => wireConn(conn));
+    net.peer.on('error', (err) => {
+      if (String(err).includes('unavailable-id')) { createRoom(); return; } // 撞号重试
+      setNetMsg('创建失败：' + (err.type || err));
+    });
+  }
+
+  function joinRoom() {
+    const code = (joinInput.value || '').trim().toUpperCase();
+    if (code.length < 4) { setNetMsg('请输入有效的房间号'); return; }
+    cleanupPeer();
+    net.isHost = false;
+    net.myColor = WHITE; // 加入者执白后手
+    setNetMsg('正在连接房间…');
+    net.peer = new Peer();
+    net.peer.on('open', () => {
+      const conn = net.peer.connect(PREFIX + code, { reliable: true });
+      wireConn(conn);
+      setTimeout(() => {
+        if (!net.connected) setNetMsg('连接超时，请检查房间号或让对方重建房间');
+      }, 8000);
+    });
+    net.peer.on('error', (err) => {
+      if (String(err).includes('peer-unavailable')) setNetMsg('找不到该房间，请核对房间号');
+      else setNetMsg('连接失败：' + (err.type || err));
+    });
+  }
+
+  function cleanupPeer() {
+    if (net.conn) { try { net.conn.close(); } catch(e){} net.conn = null; }
+    if (net.peer) { try { net.peer.destroy(); } catch(e){} net.peer = null; }
+    net.connected = false;
+  }
+
+  function leaveRoom() {
+    cleanupPeer();
+    netRoomInfo.style.display = 'none';
+    netSetup.style.display = 'flex';
+    roomCodeEl.textContent = '----';
+    joinInput.value = '';
+    setNetMsg('已退出房间');
+    reset(false);
+  }
+
+  document.getElementById('createRoom').addEventListener('click', createRoom);
+  document.getElementById('joinRoom').addEventListener('click', joinRoom);
+  document.getElementById('leaveRoom').addEventListener('click', leaveRoom);
+  joinInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinRoom(); });
+  document.getElementById('copyCode').addEventListener('click', () => {
+    const code = roomCodeEl.textContent;
+    navigator.clipboard?.writeText(code).then(
+      () => setNetMsg('房间号已复制：' + code),
+      () => setNetMsg('请手动复制房间号：' + code)
+    );
   });
-  firstEl.addEventListener('change', reset);
-  document.getElementById('undo').addEventListener('click', () => {
+
+  // ---------- 模式切换 / 按钮 ----------
+  function applyMode() {
+    const online = isOnline();
+    onlinePanel.classList.toggle('show', online);
+    firstEl.style.display = (modeEl.value.startsWith('pve')) ? '' : 'none';
+    undoBtn.style.display = online ? 'none' : '';
+    hintEl.textContent = online
+      ? '联机说明：一方点“创建房间”得到房间号，发给朋友；朋友选“联机对战”后输入房间号加入。房主执黑先手。'
+      : '15×15 棋盘，先连成五子者获胜';
+    if (online) { leaveRoom(); }
+    else { cleanupPeer(); netRoomInfo.style.display='none'; netSetup.style.display='flex'; }
+    reset(false);
+  }
+
+  document.getElementById('restart').addEventListener('click', () => {
+    if (isOnline() && !net.connected) { setNetMsg('请先连接对手再开始'); return; }
+    reset(true);
+  });
+  modeEl.addEventListener('change', applyMode);
+  firstEl.addEventListener('change', () => { if (!isOnline()) reset(false); });
+  undoBtn.addEventListener('click', () => {
+    if (isOnline()) return;
     if (gameOver) gameOver = false;
     if (!history.length) return;
-    // 人机模式悔两步（电脑+自己）
     const steps = (aiColor && history.length >= 2) ? 2 : 1;
     for (let i = 0; i < steps && history.length; i++) {
       const [r, c] = history.pop();
@@ -356,7 +565,8 @@
     updateStatus();
   });
 
-  reset();
+  applyMode();
+  reset(false);
 })();
 </script>
 </body>
